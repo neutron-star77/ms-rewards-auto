@@ -57,6 +57,26 @@ pip install -r requirements.txt
 > **首次运行**时会弹出 Edge 窗口，请手动登录一次微软账号；此后登录态会被保存，
 > 后续运行（含计划任务）即可全自动，无需再次登录，也不必在配置里写明文密码。
 
+### 邮件通知（可选）
+
+在配置文件中加入 `email_notify` 段，定时任务跑完后会把当日进度/结果发送到邮箱：
+
+```json
+"email_notify": {
+  "enabled": true,
+  "smtp_server": "smtp.qq.com",
+  "smtp_port": 465,
+  "sender": "你的QQ邮箱@qq.com",
+  "auth_code": "你的QQ邮箱SMTP授权码",
+  "recipient": "接收通知的邮箱@qq.com"
+}
+```
+
+- `auth_code` 是 QQ 邮箱的 **SMTP 授权码**（QQ 邮箱 → 设置 → 账户 → 生成授权码），不是 QQ 密码。
+- NAS 版写入 `config_nas.json`（`nas_main.py` 读取）；新版入口 `rewards_earn.py` 读取 `config.json`。
+- 仅**定时触发**发送邮件；面板「立即执行」（`IMMEDIATE=1`）视为手动操作，不发邮件以免打扰。
+- 未配置或发送失败均静默跳过，不影响签到主流程。
+
 ## 运行
 
 ```powershell
@@ -98,7 +118,8 @@ python main.py
 
 | 文件 | 作用 |
 |------|------|
-| `nas_main.py` | NAS 版主脚本（登录态注入 + 支持 `--keepalive` 保活） |
+| `rewards_earn.py` | 新版主脚本（Docker 镜像默认入口，含邮件通知） |
+| `nas_main.py` | NAS 版主脚本（登录态注入 + `--keepalive` 保活 + 邮件通知） |
 | `nas_cron.sh` | 宿主机 cron 每日触发脚本（随机延迟 + docker run） |
 | `nas_keepalive.sh` | 登录态保活脚本（约每 18 天跑一次延长会话） |
 | `Dockerfile` | 构建 `ms-rewards` 镜像 |

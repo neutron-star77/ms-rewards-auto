@@ -140,7 +140,17 @@ def _click_card_links(page: Page, base_url: str, selector: str, label_prefix: st
                 continue
             seen.add(h)
             urls.append(h)
-        console.print(f"[cyan]  {label_prefix}：发现 {len(urls)} 个未完成任务卡片（跳过 {skipped} 个已完成）[/cyan]")
+        if not urls and skipped > 0:
+            # 全部卡片都已完成（如「活动: 3/3」），这是正常成功状态，
+            # 并非失败。明确打印，避免面板日志被误读为「0/N 失败」。
+            console.print(
+                f"[green]  {label_prefix}：{skipped} 个卡片均已完成，无需操作（今日已达成）。[/green]"
+            )
+        else:
+            console.print(
+                f"[cyan]  {label_prefix}：发现 {len(urls)} 个未完成任务卡片"
+                f"（跳过 {skipped} 个已完成）[/cyan]"
+            )
         for i, url in enumerate(urls):
             try:
                 page.goto(base_url, wait_until="domcontentloaded", timeout=30000)
@@ -183,7 +193,7 @@ def _collect_earn_cards(page: Page):
             "els => els.map(e => ({href: e.getAttribute('href') || '', text: (e.innerText || '').trim()}))",
         )
         btn_data = page.eval_on_selector_all(
-            "button.rounded-cornerCardDefault",
+            "button.rounded-cornerCardDefault, div.rounded-cornerCardDefault",
             "els => els.map(e => ({text: (e.innerText || '').trim()}))",
         )
         cards = []
@@ -209,6 +219,13 @@ def _collect_earn_cards(page: Page):
             m = re.search(r"搜索:\s*([0-9]+)/([0-9]+)", text)
             if m and m.group(1) != m.group(2):
                 cards.append({"kind": "search", "text": text})
+            else:
+                # 每日连续打卡活动：文本含「活动: X/Y」且未完成（X<Y）。
+                # 这类卡片需点击展开右侧侧边栏、再点里面 3 个搜索链接才算完成，
+                # 不能直接当作「已完成」跳过。
+                am = re.search(r"活动:\s*([0-9]+)/([0-9]+)", text)
+                if am and am.group(1) != am.group(2):
+                    cards.append({"kind": "activity", "text": text})
         return cards
     except Exception as e:
         console.print(f"[yellow]  收集日常任务卡片失败：{e}[/yellow]")
@@ -232,6 +249,8 @@ def do_earn_tasks(page: Page):
                     _do_search_streak(page, card.get("text", ""))
                 elif kind == "puzzle":
                     _do_puzzle_card(page, card.get("href", ""))
+                elif kind == "activity":
+                    _do_activity_card(page, card.get("text", ""))
                 else:
                     _do_link_card(page, card.get("href", ""))
                 random_delay(2, 4)
@@ -331,6 +350,123 @@ def _do_search_streak(page: Page, card_text: str):
         page.goto(earn_url, wait_until="domcontentloaded", timeout=30000)
 
 
+def _do_activity_card(page: Page, card_text: str):
+    """处理「每日连续打卡活动」(文本含「活动: 0/3」) 的卡片。
+
+    流程（模拟真人）：
+      1. 真实鼠标点击该卡片 → 右侧出现侧边栏，内含 3 个搜索链接。
+      2. 逐个点击侧边栏链接（通常新开标签）→ 模仿真人滚动/停留查看 → 关闭标签。
+      3. 3 个都完成后，卡片进度变为「活动: 3/3」。
+    """
+    earn_url = "https://rewards.bing.com/earn"
+    console.print(f"[cyan]    处理每日连续打卡活动：{card_text[:30]}...[/cyan]")
+    try:
+        # 1) 找到卡片元素（含「活动:」且未完成），用真实鼠标点击
+        handle = page.evaluate_handle(
+            "() => { const els = Array.from(document.querySelectorAll("
+            "'button.rounded-cornerCardDefault, div.rounded-cornerCardDefault, a.rounded-cornerCardDefault')); "
+            "const el = els.find(x => { const t = (x.innerText||''); "
+            "return t.includes('活动:') && !/\\s3\\/3/.test(t) && !t.includes('已完成'); }); "
+            "return el || null; }"
+        ).as_element()
+        if not handle:
+            console.print("[yellow]    未找到每日连续打卡活动卡片[/yellow]")
+            return
+        try:
+            handle.scroll_into_view_if_needed()
+            box = handle.bounding_box()
+            if not box:
+                handle.click()
+            else:
+                jx = box["x"] + box["width"] * random.uniform(0.35, 0.65)
+                jy = box["y"] + box["height"] * random.uniform(0.35, 0.65)
+                page.mouse.move(jx, jy, steps=random.randint(8, 20))
+                random_delay(0.2, 0.6)
+                page.mouse.click(jx, jy)
+            console.print("[green]    已点击活动卡片，等待侧边栏加载...[/green]")
+        except Exception as e:
+            console.print(f"[yellow]    点击活动卡片失败：{e}[/yellow]")
+            return
+        random_delay(3, 6)
+
+        # 2) 等待侧边栏中的搜索链接出现
+        try:
+            page.wait_for_selector("a[href*='bing.com/search']", timeout=15000)
+        except Exception:
+            console.print("[yellow]    侧边栏未出现搜索链接（可能已是 3/3 或页面异常）[/yellow]")
+            return
+
+        # 3) 收集侧边栏链接（去重）
+        links = page.eval_on_selector_all(
+            "a[href*='bing.com/search']",
+            "els => els.map(e => e.getAttribute('href')).filter(Boolean)"
+        )
+        seen = set()
+        urls = []
+        for h in links:
+            if h in seen:
+                continue
+            seen.add(h)
+            urls.append(h)
+        console.print(f"[cyan]    侧边栏发现 {len(urls)} 个活动搜索链接[/cyan]")
+
+        ctx = page.context
+        for i, url in enumerate(urls):
+            before = len(ctx.pages)
+            try:
+                # 模拟真人点击侧边栏链接（通常会新开标签）
+                _real_mouse_click(page, f"a[href='{url}']", timeout=8000)
+            except Exception:
+                pass
+            # 判断目标页：新开的标签，或退化为当前页直接跳转
+            target = None
+            if len(ctx.pages) > before:
+                target = ctx.pages[-1]
+            else:
+                target = ctx.new_page()
+                try:
+                    target.goto(url, wait_until="domcontentloaded", timeout=30000)
+                except Exception:
+                    pass
+            if target and not target.is_closed():
+                try:
+                    target.wait_for_load_state("domcontentloaded", timeout=15000)
+                    # 模仿真人浏览：滚动查看搜索结果
+                    target.mouse.wheel(0, random.randint(300, 700))
+                    random_delay(3, 6)
+                    target.mouse.wheel(0, random.randint(-600, -200))
+                    random_delay(2, 4)
+                    console.print(f"[green]    [{i + 1}/{len(urls)}] 已完成活动子任务（搜索）[/green]")
+                except Exception as e:
+                    console.print(f"[yellow]    子任务 {i + 1} 浏览失败：{e}[/yellow]")
+                finally:
+                    try:
+                        target.close()
+                    except Exception:
+                        pass
+            random_delay(1.5, 3)
+
+        # 4) 回到 earn 页，确认进度
+        try:
+            page.goto(earn_url, wait_until="domcontentloaded", timeout=30000)
+            random_delay(2, 4)
+            body = page.inner_text("body")
+            m = re.search(r"活动:\s*([0-9]+/[0-9]+)", body)
+            if m:
+                console.print(f"[cyan]    活动进度：{m.group(1)}[/cyan]")
+            else:
+                console.print("[yellow]    未能读取活动进度[/yellow]")
+        except Exception as e:
+            console.print(f"[yellow]    读取活动进度失败：{e}[/yellow]")
+    except Exception as e:
+        console.print(f"[yellow]    每日连续打卡活动处理失败：{e}[/yellow]")
+    finally:
+        try:
+            page.goto(earn_url, wait_until="domcontentloaded", timeout=30000)
+        except Exception:
+            pass
+
+
 def do_dashboard_tasks(page: Page):
     console.print("[cyan]打开 Rewards 仪表盘，处理每日活动...[/cyan]")
     try:
@@ -391,6 +527,8 @@ def do_mobile_searches(page: Page, count: int):
 
 
 def print_progress(page: Page):
+    """回到仪表盘，仅打印各项任务完成进度（不重复执行任务），并返回进度文本。"""
+    lines = []
     try:
         try:
             cdp = page.context.new_cdp_session(page)
@@ -400,16 +538,57 @@ def print_progress(page: Page):
         page.goto("https://rewards.bing.com/dashboard", wait_until="domcontentloaded", timeout=30000)
         random_delay(2, 4)
         body = page.inner_text("body")
-        console.print("[bold cyan]----- 今日任务进度 -----[/bold cyan]")
+        lines.append("----- 今日任务进度 -----")
         for label in ["搜索:", "活动:", "签到:"]:
             m = re.search(re.escape(label) + r"\s*([0-9]+/[0-9]+)", body)
             if m:
-                console.print(f"[cyan]  {label} {m.group(1)}[/cyan]")
+                lines.append(f"  {label} {m.group(1)}")
         mp = re.search(r"可用积分\s*([0-9,]+)", body)
         if mp:
-            console.print(f"[green]  当前可用积分：{mp.group(1)}[/green]")
+            lines.append(f"  当前可用积分：{mp.group(1)}")
     except Exception as e:
-        console.print(f"[yellow]读取进度失败：{e}[/yellow]")
+        lines.append(f"读取进度失败：{e}")
+    for ln in lines:
+        console.print(f"[cyan]{ln}[/cyan]")
+    return "\n".join(lines)
+
+
+def _send_progress_email(progress_text: str, config: dict):
+    """把每日进度文本通过 SMTP 发送到配置中的邮箱（QQ 邮箱用授权码登录）。
+
+    未启用或配置不完整时静默跳过，不影响主流程。
+    """
+    ec = config.get("email_notify") or {}
+    if not ec.get("enabled"):
+        return
+    sender = ec.get("sender") or ec.get("recipient")
+    recipient = ec.get("recipient")
+    auth = ec.get("auth_code")
+    server = ec.get("smtp_server", "smtp.qq.com")
+    port = int(ec.get("smtp_port", 465))
+    if not (sender and recipient and auth):
+        console.print("[yellow]  邮件通知未完整配置（需 sender / recipient / auth_code），跳过发送。[/yellow]")
+        return
+    try:
+        import smtplib, ssl
+        from email.mime.text import MIMEText
+        from email.header import Header
+        msg = MIMEText(progress_text, "plain", "utf-8")
+        msg["Subject"] = Header(f"微软积分每日进度 {datetime.now():%Y-%m-%d}", "utf-8")
+        msg["From"] = sender
+        msg["To"] = recipient
+        if int(port) == 465:
+            with smtplib.SMTP_SSL(server, int(port), timeout=20) as s:
+                s.login(sender, auth)
+                s.sendmail(sender, [recipient], msg.as_string())
+        else:
+            with smtplib.SMTP(server, int(port), timeout=20) as s:
+                s.starttls(context=ssl.create_default_context())
+                s.login(sender, auth)
+                s.sendmail(sender, [recipient], msg.as_string())
+        console.print(f"[green]  进度已发送至邮箱：{recipient}[/green]")
+    except Exception as e:
+        console.print(f"[yellow]  邮件发送失败：{e}[/yellow]")
 
 
 def _ensure_logged_in(page: Page):
@@ -525,8 +704,10 @@ def run():
             m_page = context.new_page()
             do_mobile_searches(m_page, mobile_count)
             m_page.close()
-        console.print("[yellow]提示：「移动应用 签到」为 Bing 手机 App 专属任务，请在手机 Bing App 内补签。[/yellow]")
-        print_progress(page)
+        progress_text = print_progress(page)
+        # 仅定时任务发邮件；面板「立即执行」(IMMEDIATE=1) 为手动触发，不发以免打扰。
+        if os.environ.get("IMMEDIATE") != "1":
+            _send_progress_email(progress_text, config)
         _save_storage_state(context)   # 每次任务后回写，顺延登录态
         context.close()
 
