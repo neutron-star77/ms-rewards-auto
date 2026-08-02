@@ -87,6 +87,21 @@ def is_monthly_strategy(text: str, href: str) -> bool:
     return bool(re.search(r"\d\s*/\s*4\s*个任务", text or ""))
 
 
+def is_locked_monthly(text: str, href: str = "") -> bool:
+    """识别「本月攻略」中尚未到开放时间的锁定周任务（左侧显示小锁图标）。
+
+    锁定周既不是「已完成」也不是「未完成待重试」，而是未来某周（如第二/三/四周）
+    才开放——用户实测：八月第一周其余三周左侧显示小锁，分别要第二/三/四周才开放。
+    这类任务不应被点击、不应计入未完成、更不应写进「未完成」邮件清单。
+
+    文本信号（可靠，来自页面文案）：含『到期日期 / X周后 / X天后 / 锁定 / 未解锁 /
+    即将开放』等。注意：仅对 is_monthly_strategy 命中的任务使用本判定，避免误伤。
+    """
+    t = text or ""
+    return bool(re.search(
+        r"到期日期|\d+\s*周(后|内)|\d+\s*天(后|内)|锁定|未解锁|即将开放|未开放|暂不可", t))
+
+
 # 结构级异常（如「本月攻略定位器整月零匹配」）单独收集，发【结构异常】告警邮件，
 # 与日常「有 N 项未完成」的噪音级邮件区分（见 ADR-0002 §3.5）。
 STRUCTURAL_FAILURES: list = []
@@ -587,17 +602,52 @@ async def handle_quiz(np: Page):
         except Exception:
             continue
 
+    # 只用 Bing quiz 专属的答案选项 class，避免命中搜索结果页里的普通按钮
+    # （div[role='button'] / a[role='button'] 太宽，会误点搜索框、菜单等）
     option_selectors = [
         "[class*='rqAnswerOption' i]", "[class*='answerOption' i]",
-        "[class*='b_ans' i] a", "[class*='option' i]",
-        "div[role='button']", "a[role='button']",
+        "[class*='b_ans' i] a", "[class*='quizOption' i]",
+        "[class*='option' i]", "[class*='answer' i]",
     ]
 
     def frames():
         # 主页面 + 所有 iframe，都尝试
         return [np] + list(np.frames)
 
-    for round_i in range(6):  # 最多 6 轮（覆盖多题）
+    # 前置门槛：先确认页面真有可点答案选项（搜索结果页无此类元素，直接跳过不误点）
+    _has_option = False
+    for fr in frames():
+        for sel in option_selectors:
+            try:
+                if await fr.locator(sel).count() > 0:
+                    _has_option = True
+                    break
+            except Exception:
+                continue
+        if _has_option:
+            break
+    if not _has_option:
+        print("      未检测到问答答案选项，跳过逐题点选（疑似非 quiz 页）")
+        return
+
+    # 终态标记：出现即代表整份测验已答完，应立即停止点选（避免无脑点满多轮）
+    _terminal_markers = ["已完成", "查看成绩", "你已完成", "完成!", "全部完成",
+                         "view your score", "quiz complete", "you completed",
+                         "see your score", "成绩"]
+
+    async def _is_terminal():
+        try:
+            txt = await np.evaluate("() => document.body ? document.body.innerText : ''")
+        except Exception:
+            return False
+        low = txt.lower()
+        return any(m.lower() in low for m in _terminal_markers)
+
+    for round_i in range(10):  # 上限 10 轮（覆盖多题），但命中终态即提前 break
+        # 每轮开点前先确认还没答完，避免重复点已完成的题
+        if await _is_terminal():
+            print(f"      检测到测验已完成标记，提前结束点选（第{round_i + 1}轮前）")
+            break
         clicked = False
         for fr in frames():
             for sel in option_selectors:
@@ -608,7 +658,7 @@ async def handle_quiz(np: Page):
                     continue
                 if cnt == 0:
                     continue
-                # 随机挑一个可见选项点击
+                # 只点第一个可见选项（Bing quiz 每点一题即提交并翻到下一题）
                 for i in range(min(cnt, 6)):
                     opt = opts.nth(i)
                     try:
@@ -627,10 +677,32 @@ async def handle_quiz(np: Page):
             if clicked:
                 break
         if not clicked:
-            print("      未发现更多可点选项，测验流程结束")
+            # 没可点选项：再给一次终态机会，否则判定结束
+            if await _is_terminal():
+                print("      检测到测验已完成标记，结束点选")
+            else:
+                print("      未发现更多可点选项，测验流程结束")
             break
-        await asyncio.sleep(rand(2.0, 3.5))
-    await asyncio.sleep(rand(2.0, 4.0))
+        # 等本题提交/翻页（原 2-3.5s，缩短以减少冗余等待）
+        await asyncio.sleep(rand(1.5, 2.5))
+    await asyncio.sleep(rand(1.5, 2.5))  # 收尾等待（原 2-4s）
+
+
+async def _has_real_quiz_elements(np: Page) -> bool:
+    """页面是否真含 Bing 问答(quiz)容器，而非普通搜索结果页。
+
+    必应搜索结果页到处是『问题/question』字样，故只用问答专属 class 判定，
+    避免把搜索页误当成 quiz 去逐题点选（用户实测：『探索阿马尔菲』『即将举行的体育赛事』
+    等 search 型每日活动都被误判为测验页去点答案）。
+    """
+    try:
+        html = await np.content()
+    except Exception:
+        return False
+    low = html.lower()
+    markers = ["rqansweroption", "answeroption", "officequiz", "welcomequiz",
+               "b_ans", "quizoption", "quizcontainer", "btcorpus", "fyestrivia"]
+    return any(m in low for m in markers)
 
 
 async def handle_puzzle_or_quiz(np: Page) -> bool:
@@ -645,8 +717,10 @@ async def handle_puzzle_or_quiz(np: Page) -> bool:
     low_url = np.url.lower()
     low_content = content.lower()
     is_puzzle = ("拼图" in content) or ("imagepuzzle" in low_url) or ("puzzle" in low_url)
-    is_quiz = ("问题" in content) or ("quiz" in low_url) or ("你是否知道" in content) \
-        or ("quiz" in low_content) or ("question" in low_content)
+    # 注意：不能用裸「问题/question」判定——中文/必应搜索结果页到处是这些词，会被误判成 quiz 去点选答案。
+    # 仅当页面含明确的测验信号：URL 含 quiz / 文案含「你是否知道」「测验」/ 或真含问答容器 class。
+    is_quiz = ("quiz" in low_url) or ("你是否知道" in content) or ("测验" in content) \
+        or (await _has_real_quiz_elements(np))
     if not (is_puzzle or is_quiz):
         return False
 
@@ -886,13 +960,16 @@ async def run_offer(target: Page, href: str, typ: str):
     if typ == "search":
         # 带奖励参数的搜索页载入即计分，静候入账
         await asyncio.sleep(rand(5.0, 9.0))
-        # 部分「每日活动」链接虽为 bing.com/search，实为内嵌问答(quiz)
-        # （如「探索…的好处」「测试你对这些主题的知识」）。仅等待不会计完成分，
-        # 需逐题点选答案。best-effort：检测页面是否含问答模块，有则处理。
+        # 极少数「每日活动」的 bing.com/search 链接内嵌真实问答(quiz)，需逐题点选；
+        # 但必应搜索结果页本身不是 quiz——只有页面真含问答容器时才处理，
+        # 避免把普通搜索页误当 quiz 去点选答案（用户实测：『探索阿马尔菲』『即将举行的体育赛事』等）。
         try:
-            handled = await handle_puzzle_or_quiz(target)
-            if handled:
-                print("    search 页识别为问答，已执行点选答案流程")
+            if await _has_real_quiz_elements(target):
+                handled = await handle_puzzle_or_quiz(target)
+                if handled:
+                    print("    search 页识别为真实问答，已执行点选答案流程")
+            else:
+                print("    search 页无问答容器，按搜索即计分处理（不点选）")
         except Exception as e:
             print(f"    search 页问答补充处理异常: {e}")
     elif typ == "puzzle":
@@ -977,7 +1054,7 @@ async def task_dashboard_activities(page: Page, context: BrowserContext):
                 except Exception:
                     pass
         await asyncio.sleep(rand(1.5, 3.0))
-    print("    每日活动处理完成")
+    print("    其它 dashboard 任务处理完成（每日活动由 task_dashboard_daily_set 专项处理）")
 
 
 async def task_dashboard_daily_set(page: Page, context: BrowserContext = None, log=None):
@@ -1019,13 +1096,13 @@ async def task_dashboard_daily_set(page: Page, context: BrowserContext = None, l
     cards = []
     if panel is not None:
         try:
-            cards = panel.locator("a[href*='bing.com/search']").all()
+            cards = await panel.locator("a[href*='bing.com/search']").all()
         except Exception:
             cards = []
     if not cards:
         # 兜底：整页直接找 DailySet 卡片
         try:
-            cards = page.locator("a[href*='DailySet']").all()
+            cards = await page.locator("a[href*='DailySet']").all()
         except Exception:
             cards = []
 
@@ -1048,7 +1125,13 @@ async def task_dashboard_daily_set(page: Page, context: BrowserContext = None, l
                     await card.click(force=True, timeout=5000)
             popup = await pop.value
             await popup.wait_for_timeout(3000)
-            _check_puzzle_or_quiz(popup, log)
+            # 弹窗内可能是 puzzle/quiz 互动题，需答完才计完成（函数名须用真实存在的
+            # handle_puzzle_or_quiz；此前误写 _check_puzzle_or_quiz 会抛 NameError
+            # 并被外层 except 吞掉，静默走到「非弹窗」分支）
+            try:
+                await handle_puzzle_or_quiz(popup)
+            except Exception as _e:
+                log(f"[daily_set] puzzle/quiz 处理异常: {_e}")
             try:
                 await popup.close()
             except Exception:
@@ -1082,7 +1165,8 @@ async def task_dashboard_daily_set(page: Page, context: BrowserContext = None, l
     claimed = 0
     try:
         claim_btn = page.locator("button:has-text('可领取')").first
-        if claim_btn.count() and await claim_btn.is_visible():
+        # 注意：async API 的 count() 返回 coroutine，未 await 时恒为真值 → 必须 await
+        if await claim_btn.count() and await claim_btn.is_visible():
             num_txt = ""
             try:
                 num_txt = await claim_btn.locator("p.text-pageHeader").inner_text()
@@ -1097,13 +1181,50 @@ async def task_dashboard_daily_set(page: Page, context: BrowserContext = None, l
                     await claim_btn.click(timeout=5000)
                 except Exception:
                     await claim_btn.click(force=True, timeout=5000)
-                # 等待右侧栏「领取积分」出现并点击
+                # 点击「可领取」后，右侧栏(flyout)弹出，其下方会出现「领取积分」按钮，
+                # 点击它才会真正把奖励积分入账（可领取归零、总积分增加）。
+                # 必须先等 flyout 真正弹出，再在 flyout 内定位，否则页面级 text= 易因时机/匹配超时。
                 try:
-                    claim2 = page.locator("text=领取积分").first
-                    await claim2.wait_for(state="visible", timeout=8000)
+                    await page.wait_for_timeout(2500)  # 等右侧栏渲染
+                    # 先确认右侧栏已弹出
+                    fly = await find_flyout(page)
+                    claim2 = None
+                    if fly is not None:
+                        # flyout 内的「领取积分」：优先 button/可点击元素，再退化为任意含该文字的元素
+                        for sel in ["button:has-text('领取积分')",
+                                    "a:has-text('领取积分')",
+                                    "div:has-text('领取积分')",
+                                    "text=领取积分"]:
+                            cand = fly.locator(sel).first
+                            if await cand.count() and await cand.is_visible():
+                                claim2 = cand
+                                break
+                    if claim2 is None:
+                        # flyout 内没找到，退化为页面级（并放宽到含「领取」的可点击元素）
+                        for sel in ["button:has-text('领取')",
+                                    "a:has-text('领取')",
+                                    "text=领取积分"]:
+                            cand = page.locator(sel).first
+                            if await cand.count() and await cand.is_visible():
+                                claim2 = cand
+                                break
+                    if claim2 is None:
+                        raise RuntimeError("点击『可领取』后未出现『领取积分』")
                     await claim2.click(timeout=5000)
                 except Exception as e:
                     log(f"[daily_set] 未找到/点击『领取积分』: {e}")
+                    # 诊断：落盘当前页面 + flyout HTML，便于离线核对「领取积分」真实结构
+                    try:
+                        await _snapshot(page, "dbg_claim")
+                        f2 = await find_flyout(page)
+                        if f2 is not None:
+                            html = await f2.inner_html()
+                            import os as _os
+                            _os.makedirs("dbg", exist_ok=True)
+                            with open("dbg/dbg_claim_flyout.html", "w", encoding="utf-8") as _fh:
+                                _fh.write(html)
+                    except Exception:
+                        pass
                 await page.wait_for_timeout(3000)
                 after = await read_available_points(page)
                 claimed = max(0, (after or 0) - (before or 0))
@@ -1184,37 +1305,72 @@ async def task_monthly_strategy(page: Page, context: BrowserContext):
                 const h3s = Array.from(document.querySelectorAll('h3'));
                 const out = [];
                 const seen = new Set();
+                // 绿勾信号：容器 class / 状态文案 / 勾选字形（已完成周）
+                const GREEN = /statusSuccessRewardsBg|successrewards|completed|checkmark|已打卡|已完成|✓|✔|<svg[^>]*aria-label="?completed/i;
+                // 锁定信号：小锁图标（class/aria/title 含 lock，排除 unlock）或文案含『锁定/未解锁/到期日期/X周后/X天后/即将开放』
+                const LOCK = /到期日期|\d+\s*周(后|内)|\d+\s*天(后|内)|锁定|未解锁|即将开放|未开放|暂不可/i;
+                function hasLockIcon(el){
+                    if(!el) return false;
+                    const q = '[class*="lock" i]:not([class*="unlock" i]), [aria-label*="lock" i], [aria-label*="锁定" i], [title*="lock" i], [title*="锁定" i]';
+                    try { return !!el.querySelector(q); } catch(e){ return false; }
+                }
                 for (const h3 of h3s) {
-                    const txt = (h3.innerText || '');
-                    if (!/点击完成|打卡/.test(txt)) continue;
-                    let row = h3.parentElement;
-                    for (let i = 0; i < 6 && row; i++) {
-                        const html = row.innerHTML || '';
-                        if (/statusSuccessRewardsBg|ctrlChoiceBaseStrokeRest/.test(html)
-                            || row.querySelector('a[href*="bing.com/search"]')) break;
+                    const txt = (h3.innerText || '').replace(/\s+/g, ' ').trim();
+                    // 周任务行标题：含『点击完成/打卡』或『周/Week/第N/任务/quest』等
+                    const titleHit = /点击完成|打卡|周|week|第\s*\d|quest|任务|挑战|完成/i.test(txt);
+                    // 向上定位该周任务容器（命中状态/搜索链接/卡片容器即停）
+                    let row = h3;
+                    for (let i = 0; i < 8 && row; i++) {
+                        const h = row.innerHTML || '';
+                        if (/statusSuccessRewardsBg|ctrlChoiceBaseStrokeRest/.test(h)
+                            || row.querySelector('a[href*="bing.com/search"]')
+                            || /rewardsCard|rewardsModule|disclosure|item-|module/i.test(row.className || '')) break;
                         row = row.parentElement;
                     }
                     if (!row || seen.has(row)) continue;
-                    seen.add(row);
                     const rhtml = row.innerHTML || '';
-                    const rtext = row.innerText || '';
-                    const done = /statusSuccessRewardsBg/i.test(rhtml) || /已完成|已打卡|✓|✔/.test(rtext);
+                    const rtext = (row.innerText || '').replace(/\s+/g, ' ');
+                    // 锁定：文案出现锁定信号 或 行内存在小锁图标（锁定周标题可能不含标题关键词）
+                    const lockHit = LOCK.test(rtext) || hasLockIcon(row);
+                    if (!titleHit && !lockHit) continue;
+                    seen.add(row);
+                    // 绿勾：容器本身或向上若干层祖先含绿勾信号
+                    let green = GREEN.test(rhtml) || GREEN.test(rtext);
+                    if (!green) {
+                        let p = row.parentElement;
+                        for (let i = 0; i < 5 && p; i++) {
+                            if (GREEN.test(p.innerHTML || '')) { green = true; break; }
+                            p = p.parentElement;
+                        }
+                    }
                     const a = row.querySelector('a[target="_blank"][href*="bing.com/search"]')
                             || row.querySelector('a[href*="bing.com/search"]');
-                    out.push({ done, href: a ? a.href : '', title: txt.slice(0, 40) });
+                    const href = a ? a.href : '';
+                    // done=绿勾；locked=锁定（未到开放时间，既不是已完成也不是待完成，直接忽略，绝不点击/计入未完成）
+                    const done = green && !lockHit;
+                    const locked = lockHit && !green;
+                    out.push({ done, locked, href, title: txt.slice(0, 40) });
                 }
                 return out;
             }""")
 
         rows = await scan_punchcard_rows(target)
         weekly_done = sum(1 for r in rows if r["done"])
-        _write_monthly_state(weekly_done, len(rows))
-        print(f"    本月攻略共 {len(rows)} 个周任务行")
+        weekly_locked = sum(1 for r in rows if r["locked"])
+        weekly_open = len(rows) - weekly_locked
+        _write_monthly_state(weekly_done, weekly_open)
+        print(f"    本月攻略共 {len(rows)} 个周任务行（含锁定未开放 {weekly_locked} 个）")
         for i, r in enumerate(rows):
-            mark = "✓绿勾" if r["done"] else "○未勾"
+            if r["done"]:
+                mark = "✓绿勾"
+            elif r["locked"]:
+                mark = "🔒锁定"
+            else:
+                mark = "○未勾"
             print(f"      [{i}] {mark}  {r['title'][:30]}  {r['href'][:50]}")
-        uniq = [r for r in rows if not r["done"] and r["href"]]
-        print(f"    其中未勾选且有跳转链接的周任务：{len(uniq)} 个")
+        # 仅处理「未勾选且未锁定且含跳转链接」的当前开放周；锁定周直接忽略（不点击、不计入未完成）
+        uniq = [r for r in rows if not r["done"] and not r["locked"] and r["href"]]
+        print(f"    其中未勾选(且非锁定)且有跳转链接的当前开放周：{len(uniq)} 个")
         for r in uniq:
             print(f"  ▶ 真人点击未勾选周任务：{r['title'][:30]}  ->  {r['href'][:60]}")
             # 用 Locator 按绝对 href 定位（比 evaluate_handle 更稳），真人点击弹出搜索页
@@ -1482,9 +1638,13 @@ async def task_search_card(page: Page, context: BrowserContext):
     print("[1a] 处理「必应搜索」连续打卡...")
     card = None
     for url in [EARN_URL, DASHBOARD_URL]:
+        # 必应奖励卡片的「搜索: x/1」进度徽标是异步加载的，必须等其渲染就绪，
+        # 否则会读到「0/1」甚至还没出数字，误判为未完成而重复搜索。
+        # 注意：不能只在「跨页面跳转」时才等——主流程/复检调用本函数时页面往往
+        # 已停在 EARN 页，会跳过 goto 与等待，直接读到未就绪的徽标。故无论是否跳转都等待。
         if url.rstrip("/") not in page.url.rstrip("/"):
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(3500)
+        await page.wait_for_timeout(4500)
         for kw in ["必应搜索连续打卡", "必应搜索", "使用必应搜索"]:
             c = await find_card_by_keyword(page, kw)
             if c is not None:
@@ -1495,10 +1655,19 @@ async def task_search_card(page: Page, context: BrowserContext):
     if card is None:
         print("    未找到必应搜索卡片，跳过")
         return
+    # 读取完成状态：进度徽标可能仍在异步校验，先等两轮确认，避免误把已 1/1 当成未完成
     txt = await card.inner_text()
     if "1/1" in txt or "1 / 1" in txt:
         print("    已显示 搜索: 1/1，跳过")
         return
+    if "0/1" not in txt and "0 / 1" not in txt and "/" not in txt:
+        # 进度数字尚未渲染（既无 1/1 也无 0/1），再等一会儿重新读取后判定
+        await page.wait_for_timeout(3000)
+        txt = await card.inner_text()
+        if "1/1" in txt or "1 / 1" in txt:
+            print("    二次读取已显示 搜索: 1/1，跳过")
+            return
+    # 至此确认尚未完成（含明确的 0/1），需要真实搜索一次
     # 点卡片 -> 右侧栏 -> 真人点击搜索跳转链接（保留上下文，正确计分）
     before = set(await collect_hrefs(page))
     await click_card_open_flyout(page, card)
@@ -1778,6 +1947,10 @@ async def _scan_unfinished(page: Page) -> list:
             continue
         for o in raw:
             if is_nav_link(o["href"]) or not o["text"]:
+                continue
+            # 本月攻略的「锁定周」（左侧小锁，未到开放时间）既不是已完成也不是未完成，
+            # 不应重试、也不应写入「未完成」邮件清单（否则每月会误报未来周任务）
+            if is_monthly_strategy(o["text"], o["href"]) and is_locked_monthly(o["text"], o["href"]):
                 continue
             if o["done"] or _looks_done(o["text"]):
                 continue
