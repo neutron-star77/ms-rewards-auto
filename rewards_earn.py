@@ -94,6 +94,7 @@ STRUCTURAL_FAILURES: list = []
 # 积分差额自审：运行前后「可用积分」余额（best-effort，读不到为 None）
 POINTS_BEFORE = None
 POINTS_AFTER = None
+DAILY_SET_RESULT = None  # 每日活动三张卡片 + 「可领取」奖励积分的处理结果（供邮件汇报）
 
 
 def _monthly_state_path() -> str:
@@ -230,6 +231,9 @@ def _build_mail_body(failed, error=""):
                 head += f"\n[积分自审] 运行前 {pb} -> 运行后 {pa}（仅一端读数成功，无法计算差额）"
     except Exception:  # noqa: BLE001
         pass
+    if DAILY_SET_RESULT is not None:
+        ds = DAILY_SET_RESULT
+        head += f"\n[每日活动] 完成 {ds.get('done')}/{ds.get('total')} 张，本次领取奖励积分 {ds.get('claimed')}"
     return f"{head}\n\n----- 本次运行日志末尾 -----\n{tail}\n"
 
 
@@ -930,6 +934,10 @@ async def task_dashboard_activities(page: Page, context: BrowserContext):
     for o in raw:
         if is_nav_link(o["href"]) or not o["text"]:
             continue
+        if "DailySet" in o["href"]:
+            # 每日活动三张卡片改由 task_dashboard_daily_set 专门处理（逐卡校验「已完成」+「可领取」领取），
+            # 避免此处 fire-and-forget 式点击导致卡片静默未完成却无人发现。
+            continue
         # 按 (href, 文本) 去重：同名/同链的子活动只点一次
         key = (o["href"], o["text"][:20])
         if key in seen:
@@ -970,6 +978,145 @@ async def task_dashboard_activities(page: Page, context: BrowserContext):
                     pass
         await asyncio.sleep(rand(1.5, 3.0))
     print("    每日活动处理完成")
+
+
+async def task_dashboard_daily_set(page: Page, context: BrowserContext = None, log=None):
+    """2b. 每日活动三张卡片 + 「可领取」奖励积分：专属于 dashboard 的 SPA 流程。
+
+    修复审计盲区（为什么「每日活动没做完却没被审计到」）：
+      - 原审计只依赖 collect_offers 的链接匹配 + 「已完成」文本，且点击后从不校验卡片
+        是否真的翻转为「已完成」（fire-and-forget，只 sleep 就走），卡片静默失败也无人发现；
+      - 原流程完全没有「可领取」奖励的领取步骤，完成每日活动后的奖励积分无法入账，
+        净增量审计因此可能「通过」而实际奖励缺失。
+    本函数：逐卡点击跳转搜索 → 轮询「已完成」→ 领取「可领取」→ 校验可用积分增加；
+    被 main 与 verify_and_retry 调用，使审计真正覆盖这一闭环。
+    返回 {"total":int, "done":int, "claimed":int}。
+    """
+    ctx = context or page.context
+    log = log or (lambda *a, **k: None)
+    try:
+        await page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=60000)
+    except Exception as e:
+        log(f"[daily_set] dashboard 打开失败: {e}")
+    await page.wait_for_timeout(3000)
+
+    # —— 定位「每日活动」折叠区面板，并确保展开 ——
+    panel = None
+    try:
+        h2 = page.locator("h2", has_text="每日活动").first
+        discl = h2.locator("xpath=ancestor::div[contains(@class,'react-aria-Disclosure')]").first
+        panel = discl.locator("div.react-aria-DisclosurePanel").first
+        # 确保折叠区已展开（aria-expanded=false 时需先点开，否则卡片不在 DOM 中）
+        try:
+            trigger = discl.locator("button[aria-expanded]").first
+            if await trigger.get_attribute("aria-expanded") == "false":
+                await trigger.click(timeout=5000)
+                await page.wait_for_timeout(1000)
+        except Exception:
+            pass
+    except Exception:
+        panel = None
+    cards = []
+    if panel is not None:
+        try:
+            cards = panel.locator("a[href*='bing.com/search']").all()
+        except Exception:
+            cards = []
+    if not cards:
+        # 兜底：整页直接找 DailySet 卡片
+        try:
+            cards = page.locator("a[href*='DailySet']").all()
+        except Exception:
+            cards = []
+
+    total = len(cards)
+    done = 0
+    for idx, card in enumerate(cards):
+        try:
+            txt = await card.inner_text()
+        except Exception:
+            txt = ""
+        if "已完成" in txt:
+            done += 1
+            continue
+        log(f"[daily_set] 处理第 {idx+1}/{total} 张每日活动卡片 ...")
+        try:
+            async with ctx.expect_page(timeout=8000) as pop:
+                try:
+                    await card.click(timeout=5000)
+                except Exception:
+                    await card.click(force=True, timeout=5000)
+            popup = await pop.value
+            await popup.wait_for_timeout(3000)
+            _check_puzzle_or_quiz(popup, log)
+            try:
+                await popup.close()
+            except Exception:
+                pass
+        except Exception:
+            # 非弹窗：原地导航（等待返回 dashboard 并刷新状态）
+            await page.wait_for_timeout(4000)
+            try:
+                if DASHBOARD_URL.rstrip("/") not in page.url:
+                    await page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=60000)
+                    await page.wait_for_timeout(2000)
+            except Exception:
+                pass
+        # 轮询该卡片是否翻转为「已完成」（最多约 18s）
+        ok = False
+        for _ in range(12):
+            try:
+                if "已完成" in await card.inner_text():
+                    ok = True
+                    break
+            except Exception:
+                pass
+            await page.wait_for_timeout(1500)
+        if ok:
+            done += 1
+            log(f"[daily_set] 第 {idx+1} 张卡片已完成 ✓")
+        else:
+            log(f"[daily_set] 第 {idx+1} 张卡片点击后未检测到「已完成」标记")
+
+    # —— 领取「可领取」奖励积分 ——
+    claimed = 0
+    try:
+        claim_btn = page.locator("button:has-text('可领取')").first
+        if claim_btn.count() and await claim_btn.is_visible():
+            num_txt = ""
+            try:
+                num_txt = await claim_btn.locator("p.text-pageHeader").inner_text()
+            except Exception:
+                num_txt = await claim_btn.inner_text()
+            m = re.search(r"\d+", num_txt.replace(",", ""))
+            amt = int(m.group()) if m else 0
+            if amt > 0:
+                log(f"[daily_set] 检测到可领取 {amt} 积分，点击领取 ...")
+                before = await read_available_points(page)
+                try:
+                    await claim_btn.click(timeout=5000)
+                except Exception:
+                    await claim_btn.click(force=True, timeout=5000)
+                # 等待右侧栏「领取积分」出现并点击
+                try:
+                    claim2 = page.locator("text=领取积分").first
+                    await claim2.wait_for(state="visible", timeout=8000)
+                    await claim2.click(timeout=5000)
+                except Exception as e:
+                    log(f"[daily_set] 未找到/点击『领取积分』: {e}")
+                await page.wait_for_timeout(3000)
+                after = await read_available_points(page)
+                claimed = max(0, (after or 0) - (before or 0))
+                log(f"[daily_set] 领取后可用积分 {before} -> {after} (Δ={claimed})")
+            else:
+                log("[daily_set] 可领取金额为 0，无需领取")
+        else:
+            log("[daily_set] 未发现可领取卡片")
+    except Exception as e:
+        log(f"[daily_set] 可领取流程异常: {e}")
+
+    log(f"[daily_set] 每日活动完成 {done}/{total}，本次领取 {claimed} 积分")
+    return {"total": total, "done": done, "claimed": claimed}
 
 
 async def task_monthly_strategy(page: Page, context: BrowserContext):
@@ -1652,6 +1799,12 @@ async def verify_and_retry(page: Page, context: BrowserContext):
     仍未完成的写入 UNFINISHED，由结果邮件直接告知，不必人工比对网页。
     """
     print("[✓] 收尾复检：重新扫描未完成任务 ...")
+    # 先把「每日活动」三张卡片 +「可领取」奖励积分做完（含完成校验与领取），
+    # 否则通用复检只认链接、看不到卡片静默未完成，也永远不会领取奖励积分。
+    try:
+        await task_dashboard_daily_set(page, context, log=print)
+    except Exception as e:
+        print(f"  ✗ 复检-每日活动专处理异常: {e}")
     remain = await _scan_unfinished(page)
     UNFINISHED.clear()
     if not remain:
@@ -1705,6 +1858,11 @@ async def verify_and_retry(page: Page, context: BrowserContext):
             print(f"      · {t}")
     else:
         print("    重试后全部完成")
+    # 末次兜底：确保「可领取」奖励积分在本轮结束前被领取（即使上方重试未触碰它）
+    try:
+        await task_dashboard_daily_set(page, context, log=print)
+    except Exception as e:
+        print(f"  ✗ 末次-每日活动专处理异常: {e}")
 
 
 async def _launch_context(p) -> BrowserContext:
@@ -1877,6 +2035,15 @@ async def main():
                 await task_dashboard_activities(page, context)
             except Exception as e:
                 print(f"  ✗ 活动打卡执行异常: {e}")
+            await asyncio.sleep(rand(1.0, 2.0))
+            # 每日活动三张卡片：专门处理（逐卡校验「已完成」+ 领取「可领取」奖励积分）
+            try:
+                global DAILY_SET_RESULT
+                DAILY_SET_RESULT = await task_dashboard_daily_set(page, context)
+                print(f"[每日活动] 完成 {DAILY_SET_RESULT['done']}/{DAILY_SET_RESULT['total']} 张，"
+                      f"本次领取奖励积分 {DAILY_SET_RESULT['claimed']}")
+            except Exception as e:
+                print(f"  ✗ 每日活动专处理异常: {e}")
             await asyncio.sleep(rand(1.0, 2.0))
             # 统一处理：直接在 earn 页面按真实任务链接真人点击（不再依赖卡片容器）
             try:

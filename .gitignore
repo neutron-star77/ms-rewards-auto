@@ -39,3 +39,14 @@ ms-playwright/
 Thumbs.db
 .idea/
 .vscode/
+
+# NAS 部署配置（含账号/路径等，绝不进公开仓库）
+config_nas.json
+
+# SSH 公钥种子（含授权信息，泄露等同于暴露 NAS 登录通道）
+authorized_keys_seed.txt
+
+# 调试快照 / 截图（含页面 DOM 与本地路径，非源码）
+dbg_*
+*.png
+_*
