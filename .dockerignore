@@ -1,0 +1,13 @@
+# 浏览器登录态/缓存目录：运行时通过卷挂载，不进镜像（也避免权限错误中断构建）
+edge_profile/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 临时诊断/日志
+dashboard_dump.txt
+*.log
+
+# 宿主机相关
+.git/

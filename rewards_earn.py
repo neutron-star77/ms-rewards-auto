@@ -67,6 +67,57 @@ def _install_log():
 
 # ====================== 邮件通知（NAS 定时任务结果推送） ======================
 LAST_RUN_FAILED = False
+# 收尾复检后仍未完成的任务清单：写进结果邮件，避免要人工比对网页才发现漏做
+UNFINISHED: list = []
+
+
+# ====================== 本月攻略 punchcard 的稳定识别（跨月免维护） ======================
+# 识别键取「最稳定的信号」：机器生成的 quest ID 模式 > 结构化文案特征（见 ADR-0002）。
+# 绝不写死月份名 / 子任务名——微软每月全换文案（八月标题「让这个八月收获更多」根本不叫「八月攻略」）。
+MONTHLY_QUEST_RE = re.compile(r"BingMonthlyPC_[A-Za-z]{3}_punchcard", re.I)
+
+def is_monthly_strategy(text: str, href: str) -> bool:
+    """识别「本月攻略」父卡片：优先 URL 模式，回退到结构化文案特征。
+
+    绝不写死月份名——微软每月更换标题与子任务名。仅依赖跨月稳定的结构信号。
+    """
+    if href and MONTHLY_QUEST_RE.search(href):
+        return True
+    # 回退：形如「x/4 个任务」的多子任务打卡卡片（ADR-0002 验证过的结构信号）
+    return bool(re.search(r"\d\s*/\s*4\s*个任务", text or ""))
+
+
+# 结构级异常（如「本月攻略定位器整月零匹配」）单独收集，发【结构异常】告警邮件，
+# 与日常「有 N 项未完成」的噪音级邮件区分（见 ADR-0002 §3.5）。
+STRUCTURAL_FAILURES: list = []
+
+# 积分差额自审：运行前后「可用积分」余额（best-effort，读不到为 None）
+POINTS_BEFORE = None
+POINTS_AFTER = None
+
+
+def _monthly_state_path() -> str:
+    base = "/app/data" if IS_NAS else os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "monthly_state.json")
+
+
+def _write_monthly_state(weekly_done: int, weekly_total: int) -> None:
+    """成功定位并扫描到本月攻略后记录进度，供月度看门狗独立消费（见 ADR-0002 §5.2）。
+
+    仅在确实找到卡片、完成扫描时调用；定位失败（零匹配）不写，留给看门狗发现。
+    """
+    try:
+        data = {
+            "month": time.strftime("%Y-%m"),
+            "weekly_done": weekly_done,
+            "weekly_total": weekly_total,
+            "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        with open(_monthly_state_path(), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        print(f"    已写入月度进度 monthly_state.json: {weekly_done}/{weekly_total}")
+    except Exception as e:
+        print(f"    ⚠ 写入 monthly_state.json 失败: {e}")
 
 
 def _load_mail_config():
@@ -152,9 +203,33 @@ def _build_mail_body(failed, error=""):
                 tail = "\n".join(f.read().splitlines()[-50:])
     except Exception:
         tail = "(无法读取运行日志)"
-    head = "任务执行失败，请检查登录态或页面选择器。" if failed else "任务执行成功。"
+    if failed:
+        head = "任务执行失败，请检查登录态或页面选择器。"
+    elif UNFINISHED:
+        head = f"任务已执行，但收尾复检发现 {len(UNFINISHED)} 项仍未完成（已自动重试一次）："
+        head += "\n" + "\n".join(f"  · {t}" for t in UNFINISHED)
+    else:
+        head = "任务执行成功（收尾复检：页面上所有任务均已标记完成）。"
     if error:
         head += f"\n错误信息：{error}"
+    # 积分差额自审：确认「积分真的涨了」，而非仅看页面「已完成」标记
+    try:
+        if POINTS_BEFORE is not None or POINTS_AFTER is not None:
+            pb = "?" if POINTS_BEFORE is None else str(POINTS_BEFORE)
+            pa = "?" if POINTS_AFTER is None else str(POINTS_AFTER)
+            if POINTS_BEFORE is not None and POINTS_AFTER is not None:
+                delta = POINTS_AFTER - POINTS_BEFORE
+                if delta > 0:
+                    verdict = "已确认积分增长（自审通过）"
+                elif not UNFINISHED:
+                    verdict = "余额未变化：任务标记完成但积分未增（可能延迟入账或已于昨日计入）"
+                else:
+                    verdict = "既有未完成任务、余额也未增长，疑似选择器失效或风控，需人工排查"
+                head += f"\n[积分自审] 运行前 {pb} -> 运行后 {pa}（差额 {delta:+d}）{verdict}"
+            else:
+                head += f"\n[积分自审] 运行前 {pb} -> 运行后 {pa}（仅一端读数成功，无法计算差额）"
+    except Exception:  # noqa: BLE001
+        pass
     return f"{head}\n\n----- 本次运行日志末尾 -----\n{tail}\n"
 
 
@@ -163,8 +238,20 @@ def _notify_mail(failed, error=""):
     if os.environ.get("REWARDS_MAIL_OFF") == "1":
         print("[邮件] REWARDS_MAIL_OFF=1，跳过邮件通知。")
         return
-    subject = f"微软积分自动任务 {time.strftime('%Y-%m-%d %H:%M')} - {'失败' if failed else '成功'}"
+    tag = "失败" if failed else (f"部分未完成({len(UNFINISHED)})" if UNFINISHED else "成功")
+    subject = f"微软积分自动任务 {time.strftime('%Y-%m-%d %H:%M')} - {tag}"
     send_mail(subject, _build_mail_body(failed, error))
+    # 结构级异常单独发一封【结构异常】告警，与日常「未完成」噪音级邮件区分（ADR-0002 §3.5）
+    if STRUCTURAL_FAILURES:
+        sb = "【结构异常】本次运行检测到以下结构性问题（非普通任务未完成）：\n\n"
+        sb += "\n".join(f"  · {s}" for s in STRUCTURAL_FAILURES)
+        sb += "\n\n这通常意味着页面结构 / 识别键已变化，脚本可能整月零完成而未被发现。"
+        sb += "\n请检查 is_monthly_strategy 识别键是否仍匹配当前页面（见 ADR-0002）。"
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+        send_mail(f"【结构异常】微软积分自动任务 {time.strftime('%Y-%m-%d %H:%M')}", sb)
 
 
 # 真实登录态所在的系统 Edge 默认 User Data 目录（不能直接给 Playwright 用，
@@ -552,8 +639,10 @@ async def handle_puzzle_or_quiz(np: Page) -> bool:
     except Exception:
         return False
     low_url = np.url.lower()
+    low_content = content.lower()
     is_puzzle = ("拼图" in content) or ("imagepuzzle" in low_url) or ("puzzle" in low_url)
-    is_quiz = ("问题" in content) or ("quiz" in low_url) or ("你是否知道" in content)
+    is_quiz = ("问题" in content) or ("quiz" in low_url) or ("你是否知道" in content) \
+        or ("quiz" in low_content) or ("question" in low_content)
     if not (is_puzzle or is_quiz):
         return False
 
@@ -793,6 +882,15 @@ async def run_offer(target: Page, href: str, typ: str):
     if typ == "search":
         # 带奖励参数的搜索页载入即计分，静候入账
         await asyncio.sleep(rand(5.0, 9.0))
+        # 部分「每日活动」链接虽为 bing.com/search，实为内嵌问答(quiz)
+        # （如「探索…的好处」「测试你对这些主题的知识」）。仅等待不会计完成分，
+        # 需逐题点选答案。best-effort：检测页面是否含问答模块，有则处理。
+        try:
+            handled = await handle_puzzle_or_quiz(target)
+            if handled:
+                print("    search 页识别为问答，已执行点选答案流程")
+        except Exception as e:
+            print(f"    search 页问答补充处理异常: {e}")
     elif typ == "puzzle":
         await handle_puzzle_or_quiz(target)
     elif typ == "quiz":
@@ -800,7 +898,16 @@ async def run_offer(target: Page, href: str, typ: str):
     elif typ == "punchcard":
         await handle_punchcard(target)
     else:
-        await asyncio.sleep(rand(3.0, 5.0))
+        # 未知类型同样做一次内容嗅探：不能只按 href 猜类型，
+        # 否则内嵌问答/拼图的任务会被当成「等一会儿就算完成」而漏做。
+        try:
+            if await handle_puzzle_or_quiz(target):
+                print("    other 页识别为问答/拼图，已执行交互流程")
+            else:
+                await asyncio.sleep(rand(3.0, 5.0))
+        except Exception as e:
+            print(f"    other 页问答补充处理异常: {e}")
+            await asyncio.sleep(rand(3.0, 5.0))
     await asyncio.sleep(rand(2.0, 4.0))
 
 
@@ -865,63 +972,67 @@ async def task_dashboard_activities(page: Page, context: BrowserContext):
     print("    每日活动处理完成")
 
 
-async def task_july_strategy(page: Page, context: BrowserContext):
-    """1c. 七月攻略周任务：4 周，每周一个，带绿勾的跳过、无绿勾的点击其搜索链接。
+async def task_monthly_strategy(page: Page, context: BrowserContext):
+    """1c. 本月攻略周任务：4 周，每周一个，带绿勾的跳过、无绿勾的点击其搜索链接。
 
-    用户说明：该任务（聪明出行/追逐刺激/抢购最新科技）是 4 个周子任务，每个是一个
-    跳转搜索链接；已完成的子任务会显示一个绿色勾。规则：
+    识别键见 is_monthly_strategy——绝不写死月份名 / 子任务名（见 ADR-0002）。
+    用户说明：该任务每月更换文案（如「让这个八月收获更多」），含 4 个周子任务，
+    每个是一个跳转搜索链接；已完成的子任务会显示一个绿色勾。规则：
       - 有绿勾 -> 不点击，直接跳过（关闭页面）
       - 无绿勾 -> 点击一下，跳转搜索页计分，关闭页面，看到绿勾即可
     故处理：点进 punchcard 详情页 -> 收集 4 个周搜索链接 -> 逐个判断是否已勾选
     -> 未勾选才真人点击（弹窗）-> 关闭弹窗。
     """
-    print("[1c] 处理「七月攻略」周任务（4 周，有绿勾跳过、无绿勾点击）...")
+    print("[1c] 处理「本月攻略」周任务（4 周，有绿勾跳过、无绿勾点击）...")
     # 回到干净的 earn 页
     if EARN_URL.rstrip("/") not in page.url.rstrip("/"):
         await page.goto(EARN_URL, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(3500)
-    # 在 earn 页定位七月攻略卡片
+    # 在 earn 页定位本月攻略卡片（识别键见 is_monthly_strategy，绝不写死月份名）
     card = None
     july_href = ""
-    for kw in ["七月攻略", "聪明出行", "追逐刺激", "抢购最新科技"]:
-        loc = page.locator("a").filter(has_text=kw).first
-        if await loc.count() > 0:
-            card = loc
-            try:
-                july_href = await loc.evaluate("el => el.href || ''")
-            except Exception:
-                july_href = ""
+    try:
+        offers = await collect_offers(page)
+    except Exception:
+        offers = []
+    for o in offers:
+        if is_monthly_strategy(o.get("text", ""), o.get("href", "")):
+            july_href = o.get("href", "")
+            card = page.locator('a[href*="BingMonthlyPC"]').first
             break
     if card is None:
-        print("    未找到七月攻略卡片，跳过")
+        print("    未找到本月攻略卡片（定位器零匹配）——结构级异常，已计入告警")
+        STRUCTURAL_FAILURES.append(
+            "本月攻略定位器整月零匹配：is_monthly_strategy 在 earn 页未找到任何本月攻略卡片"
+        )
         return
     popup = await click_link_get_popup(page, card)
     if popup is not None:
         await popup.wait_for_load_state("domcontentloaded")
         await asyncio.sleep(rand(2.5, 4.5))
         target = popup
-        print("    已进入七月攻略 punchcard 详情（新标签）")
+        print("    已进入本月攻略 punchcard 详情（新标签）")
     else:
         # 同页跳转：当前页即为详情页；若点击未触发导航则回退 goto
         target = page
         await asyncio.sleep(rand(2.5, 4.5))
         if "/quest/" not in page.url and july_href:
-            print("    同页未跳转，回退 goto 进入七月攻略详情")
+            print("    同页未跳转，回退 goto 进入本月攻略详情")
             try:
                 await page.goto(july_href, wait_until="domcontentloaded", timeout=60000)
                 await page.wait_for_timeout(3500)
             except Exception:
                 pass
-        print("    已进入七月攻略 punchcard 详情")
+        print("    已进入本月攻略 punchcard 详情")
     try:
         try:
-            await _snapshot(target, "july")
+            await _snapshot(target, "monthly")
         except Exception:
             pass
 
         # 基于「周任务行」结构化判定：每行含标题(h3) + 状态图标（绿勾 or 空圈）+ 可选的跳转搜索链接
         # 绿勾 = 状态图标含 bg-statusSuccessRewardsBg（已完成周）；空圈 = border-ctrlChoiceBaseStrokeRest（当前周，待点击）
-        async def scan_july_rows(pg):
+        async def scan_punchcard_rows(pg):
             return await pg.evaluate(r"""() => {
                 const h3s = Array.from(document.querySelectorAll('h3'));
                 const out = [];
@@ -948,8 +1059,10 @@ async def task_july_strategy(page: Page, context: BrowserContext):
                 return out;
             }""")
 
-        rows = await scan_july_rows(target)
-        print(f"    七月攻略共 {len(rows)} 个周任务行")
+        rows = await scan_punchcard_rows(target)
+        weekly_done = sum(1 for r in rows if r["done"])
+        _write_monthly_state(weekly_done, len(rows))
+        print(f"    本月攻略共 {len(rows)} 个周任务行")
         for i, r in enumerate(rows):
             mark = "✓绿勾" if r["done"] else "○未勾"
             print(f"      [{i}] {mark}  {r['title'][:30]}  {r['href'][:50]}")
@@ -1000,9 +1113,9 @@ async def task_july_strategy(page: Page, context: BrowserContext):
             except Exception:
                 pass
         try:
-            rows2 = await scan_july_rows(target)
+            rows2 = await scan_punchcard_rows(target)
             done_cnt = sum(1 for x in rows2 if x["done"])
-            print(f"    七月攻略周任务总计 {len(rows2)}，已勾选(绿勾) {done_cnt}，未勾选 {len(rows2) - done_cnt}")
+            print(f"    本月攻略周任务总计 {len(rows2)}，已勾选(绿勾) {done_cnt}，未勾选 {len(rows2) - done_cnt}")
         except Exception:
             pass
     finally:
@@ -1017,7 +1130,7 @@ async def task_july_strategy(page: Page, context: BrowserContext):
                 await page.wait_for_timeout(3000)
             except Exception:
                 pass
-    print("    七月攻略处理完成")
+    print("    本月攻略处理完成")
 
 
 async def process_offers(page: Page, context: BrowserContext):
@@ -1038,8 +1151,8 @@ async def process_offers(page: Page, context: BrowserContext):
     for o in raw:
         if is_nav_link(o["href"]) or not o["text"]:
             continue
-        # 七月攻略由 task_july_strategy 专门处理（需进 punchcard 逐个点周链接）
-        if any(m in o["text"] for m in ("七月攻略", "聪明出行", "追逐刺激", "抢购最新科技")):
+        # 本月攻略由 task_monthly_strategy 专门处理（需进 punchcard 逐个点周链接）
+        if is_monthly_strategy(o["text"], o["href"]):
             continue
         # 必应搜索连续打卡（搜索: x/1）由 task_search_card 专门处理：需真实搜索一次才计分，
         # 不能走 process_offers 的「载入即计分」路径（那只等待、不真正搜索 -> 永远 0/1）
@@ -1490,8 +1603,213 @@ async def debug_dump(page: Page):
 
 
 # ====================== 主流程 ======================
+def _looks_done(text: str) -> bool:
+    """从卡片可见文字判断是否已完成：含「已完成/已领取」，或形如 1/1、3/3、4/4 的进度打满。"""
+    t = text or ""
+    flat = t.replace(" ", "")
+    if "已完成" in flat or "已领取" in flat:
+        return True
+    # 注意：不能先去空格再匹配，否则「50 4/4」会被粘成「504/4」而误判未完成
+    pairs = re.findall(r"(?<![\d/])(\d+)\s*/\s*(\d+)(?![\d/])", t)
+    return bool(pairs) and all(a == b for a, b in pairs)
+
+
+async def _scan_unfinished(page: Page) -> list:
+    """重新采集 dashboard + earn，返回页面上仍未标记完成的任务（以页面状态为准）。"""
+    out, seen = [], set()
+    for url in (DASHBOARD_URL, EARN_URL):
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(3500)
+            low = page.url.lower()
+            if "login" in low or "signin" in low or "live.com" in low:
+                print(f"    ⚠ 复检 {url} 时被跳到登录页，本次复检结果不可信")
+                continue
+            raw = await collect_offers(page)
+        except Exception as e:
+            print(f"    复检采集 {url} 失败：{e}")
+            continue
+        for o in raw:
+            if is_nav_link(o["href"]) or not o["text"]:
+                continue
+            if o["done"] or _looks_done(o["text"]):
+                continue
+            key = o["text"][:24]
+            if key in seen:
+                continue
+            seen.add(key)
+            o["src"] = url
+            out.append(o)
+    return out
+
+
+async def verify_and_retry(page: Page, context: BrowserContext):
+    """收尾复检 + 自动重试：以页面「已完成」标记为准兜底。
+
+    动机：任务是否做成不能靠 classify_offer 按 href 猜（曾把内嵌问答的
+    bing.com/search 链接当成「载入即计分」而只 sleep，导致该活动一直没完成）。
+    这里跑完所有流程后重新扫描一次，凡是页面仍未标记完成的就再跑一轮；
+    仍未完成的写入 UNFINISHED，由结果邮件直接告知，不必人工比对网页。
+    """
+    print("[✓] 收尾复检：重新扫描未完成任务 ...")
+    remain = await _scan_unfinished(page)
+    UNFINISHED.clear()
+    if not remain:
+        print("    复检通过：页面上所有任务均已标记完成")
+        return
+    print(f"    复检发现 {len(remain)} 项仍未完成，开始重试：")
+    retried_special = set()
+    for o in remain:
+        text, href = o["text"], o["href"]
+        src = o.get("src", EARN_URL)
+        print(f"  ↻ 重试：{text[:30]}")
+        try:
+            # 专项任务走各自的处理器（它们内部有自己的完成判断与交互方式）
+            if "必应搜索" in text:
+                if "search" not in retried_special:
+                    retried_special.add("search")
+                    await task_search_card(page, context)
+                continue
+            if is_monthly_strategy(text, href):
+                if "monthly" not in retried_special:
+                    retried_special.add("monthly")
+                    await task_monthly_strategy(page, context)
+                continue
+            if src.rstrip("/") not in page.url.rstrip("/"):
+                await page.goto(src, wait_until="domcontentloaded", timeout=60000)
+                await page.wait_for_timeout(3000)
+            target, same_tab, _note = await click_offer(page, href, src)
+            if target is None:
+                print("    ⚠ 重试时未能定位/打开该任务")
+                continue
+            try:
+                await run_offer(target, href, classify_offer(href))
+            finally:
+                if same_tab:
+                    await page.goto(src, wait_until="domcontentloaded", timeout=60000)
+                    await page.wait_for_timeout(2500)
+                else:
+                    try:
+                        await target.close()
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"    重试异常：{e}")
+        await asyncio.sleep(rand(1.5, 3.0))
+    # 二次复检：仍未完成的记入邮件清单（只报不再重试，避免风控与死循环）
+    still = await _scan_unfinished(page)
+    UNFINISHED.extend(f"{o['text'][:40]}  [{o['href'][:70]}]" for o in still)
+    if UNFINISHED:
+        print(f"    ⚠ 重试后仍有 {len(UNFINISHED)} 项未完成，将写入结果邮件：")
+        for t in UNFINISHED:
+            print(f"      · {t}")
+    else:
+        print("    重试后全部完成")
+
+
+async def _launch_context(p) -> BrowserContext:
+    """按运行环境创建浏览器 context：NAS 用 Chromium 无头 + storage_state，本机用 Edge profile。"""
+    if IS_NAS:
+        print("启动 Chromium（headless，复用 storage_state 登录态）...")
+        ctx_kwargs = dict(
+            user_data_dir=NAS_PROFILE_DIR,
+            headless=True,
+            timeout=60000,  # 大 profile 启动可能较慢，给足超时
+            slow_mo=300,  # 放慢操作便于避开风控
+            args=[
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-dev-shm-usage",  # NAS/容器内存盘通常较小
+                "--disable-gpu",
+            ],
+        )
+        # 注意：直接把 storage_state= 传给 launch_persistent_context 在部分
+        # Playwright 版本会报 “unexpected keyword argument 'storage_state'”。
+        # 改为建好 context 后再 add_cookies，跨版本兼容（与 nas_main.py 同思路）。
+        context: BrowserContext = await p.chromium.launch_persistent_context(**ctx_kwargs)
+        if os.path.exists(NAS_STORAGE_STATE):
+            try:
+                _state = json.load(open(NAS_STORAGE_STATE, encoding="utf-8"))
+                await context.add_cookies(_state.get("cookies", []))
+                print(f"    载入登录态（add_cookies）：{NAS_STORAGE_STATE}")
+            except Exception as _e:
+                print(f"    ⚠ 载入 storage_state 失败：{_e}")
+        else:
+            print(f"    ⚠ 未找到 storage_state：{NAS_STORAGE_STATE}")
+            print(f"      请在 Windows 执行 `python rewards_earn.py export` 并拷贝该文件到 NAS。")
+        return context
+    print("启动 Edge（复用登录态）...")
+    return await p.chromium.launch_persistent_context(
+        user_data_dir=PROFILE_DIR,
+        channel="msedge",
+        headless=HEADLESS,
+        timeout=60000,  # 大 profile 启动可能较慢，给足超时
+        slow_mo=300,  # 放慢操作便于观察与避开风控
+        args=["--start-maximized", "--no-first-run", "--no-default-browser-check"],
+    )
+
+
+async def verify_only():
+    """只读复检：不点任何任务，扫描 dashboard/earn 打印仍未完成的项目。
+
+    用法：python rewards_earn.py verify —— 随时确认「今天到底还差什么」，
+    不必人工逐个比对网页，也不会因为再跑一轮而增加风控风险。
+    """
+    _install_log()
+    if IS_NAS:
+        global HEADLESS
+        HEADLESS = True
+    cleanup_locks()
+    async with async_playwright() as p:
+        context = await _launch_context(p)
+        page = await context.new_page()
+        try:
+            remain = await _scan_unfinished(page)
+            if not remain:
+                print("[复检] 页面上所有任务均已标记完成")
+            else:
+                print(f"[复检] 仍未完成 {len(remain)} 项：")
+                for o in remain:
+                    print(f"  · {o['text'][:40]}  [{o['href'][:70]}]")
+        finally:
+            try:
+                await context.close()
+            except Exception:
+                pass
+
+
+async def read_available_points(page):
+    """best-effort 读取「可用积分」余额；读不到返回 None，绝不阻塞主流程。
+
+    用于「积分差额自审」：运行前/后各读一次，差额 > 0 即确认本次签到确实涨分，
+    而非仅依赖页面「已完成」标记——后者可能因延迟入账/误判而失真。
+    """
+    try:
+        val = await page.evaluate(
+            r"""() => {
+                const E = document.querySelectorAll('*');
+                for (const e of E) {
+                    const t = (e.textContent || '').replace(/\s+/g, ' ').trim();
+                    const m = t.match(/可用积分[\s:：]*([\d,]+)/);
+                    if (m) {
+                        const n = parseInt(m[1].replace(/,/g, ''), 10);
+                        if (!isNaN(n)) return n;
+                    }
+                }
+                const m2 = (document.body && document.body.innerText || '').match(/(?:积分|奖励)[^\d]*([\d,]{3,})/);
+                if (m2) { const n = parseInt(m2[1].replace(/,/g, ''), 10); if (!isNaN(n)) return n; }
+                return null;
+            }"""
+        )
+        return val
+    except Exception as e:  # noqa: BLE001
+        print(f"  [积分自审] 读取可用积分失败（已忽略）：{e}")
+        return None
+
+
 async def main():
     _install_log()
+    global POINTS_BEFORE, POINTS_AFTER
     if IS_NAS:
         # NAS / 无头模式：跳过 Windows 专属步骤，使用 Chromium + storage_state
         global HEADLESS
@@ -1504,37 +1822,7 @@ async def main():
         setup_profile(force="refresh" in sys.argv)
         cleanup_locks()
     async with async_playwright() as p:
-        if IS_NAS:
-            print("启动 Chromium（headless，复用 storage_state 登录态）...")
-            ctx_kwargs = dict(
-                user_data_dir=NAS_PROFILE_DIR,
-                headless=True,
-                timeout=60000,  # 大 profile 启动可能较慢，给足超时
-                slow_mo=300,  # 放慢操作便于避开风控
-                args=[
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    "--disable-dev-shm-usage",  # NAS/容器内存盘通常较小
-                    "--disable-gpu",
-                ],
-            )
-            if os.path.exists(NAS_STORAGE_STATE):
-                ctx_kwargs["storage_state"] = NAS_STORAGE_STATE
-                print(f"    载入登录态：{NAS_STORAGE_STATE}")
-            else:
-                print(f"    ⚠ 未找到 storage_state：{NAS_STORAGE_STATE}")
-                print(f"      请在 Windows 执行 `python rewards_earn.py export` 并拷贝该文件到 NAS。")
-            context: BrowserContext = await p.chromium.launch_persistent_context(**ctx_kwargs)
-        else:
-            print("启动 Edge（复用登录态）...")
-            context: BrowserContext = await p.chromium.launch_persistent_context(
-                user_data_dir=PROFILE_DIR,
-                channel="msedge",
-                headless=HEADLESS,
-                timeout=60000,  # 大 profile 启动可能较慢，给足超时
-                slow_mo=300,  # 放慢操作便于观察与避开风控
-                args=["--start-maximized", "--no-first-run", "--no-default-browser-check"],
-            )
+        context: BrowserContext = await _launch_context(p)
         page = await context.new_page()
         try:
             # 关闭可能弹出的「登录以同步数据」首次启动提示（best-effort）
@@ -1577,6 +1865,13 @@ async def main():
             # 打印页面结构诊断，用于精修选择器
             await debug_dump(page)
 
+            # 积分自审：记录运行前「可用积分」余额（best-effort，失败不影响流程）
+            try:
+                POINTS_BEFORE = await read_available_points(page)
+                print(f"[积分自审] 运行前可用积分：{POINTS_BEFORE}")
+            except Exception as e:  # noqa: BLE001
+                print(f"  [积分自审] 运行前读数失败（已忽略）：{e}")
+
             # 每日连续打卡活动（活动: x/3 右侧栏）需先于普通任务处理
             try:
                 await task_dashboard_activities(page, context)
@@ -1595,11 +1890,24 @@ async def main():
             except Exception as e:
                 print(f"  ✗ 必应搜索执行异常: {e}")
             await asyncio.sleep(rand(1.0, 2.0))
-            # 七月攻略：4 周子任务，绿勾跳过、无勾点击
+            # 本月攻略：4 周子任务，绿勾跳过、无勾点击
             try:
-                await task_july_strategy(page, context)
+                await task_monthly_strategy(page, context)
             except Exception as e:
-                print(f"  ✗ 七月攻略执行异常: {e}")
+                print(f"  ✗ 本月攻略执行异常: {e}")
+            await asyncio.sleep(rand(1.0, 2.0))
+            # 收尾复检：以页面「已完成」标记为准，漏做的自动重试一轮并写入邮件
+            try:
+                await verify_and_retry(page, context)
+            except Exception as e:
+                print(f"  ✗ 收尾复检异常: {e}")
+
+            # 积分自审：记录运行后「可用积分」余额（确认本次是否真的涨分）
+            try:
+                POINTS_AFTER = await read_available_points(page)
+                print(f"[积分自审] 运行后可用积分：{POINTS_AFTER}")
+            except Exception as e:  # noqa: BLE001
+                print(f"  [积分自审] 运行后读数失败（已忽略）：{e}")
 
             print("全部任务执行完毕。")
         except Exception as e:
@@ -1659,6 +1967,9 @@ async def export_storage_state():
 if __name__ == "__main__":
     if "export" in sys.argv:
         asyncio.run(export_storage_state())
+    elif "verify" in sys.argv:
+        # 只读复检：不做任务，只报告「还差什么」，不发邮件
+        asyncio.run(verify_only())
     else:
         try:
             asyncio.run(main())
