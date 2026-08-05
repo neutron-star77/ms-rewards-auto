@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 import json
+from datetime import datetime
 
 from playwright.async_api import async_playwright, BrowserContext, Page, Locator
 
@@ -100,6 +101,29 @@ def is_locked_monthly(text: str, href: str = "") -> bool:
     t = text or ""
     return bool(re.search(
         r"到期日期|\d+\s*周(后|内)|\d+\s*天(后|内)|锁定|未解锁|即将开放|未开放|暂不可", t))
+
+
+def _parse_monthly_progress(text: str):
+    """从「N/M 个任务」解析 (done, total)；解析不到返回 (None, None)。
+
+    例：「让这个八月收获更多 +50 1/4 个任务」 -> (1, 4)。
+    """
+    m = re.search(r"(\d+)\s*/\s*(\d+)\s*个任务", text or "")
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None, None
+
+
+def current_month_week_index(now: datetime | None = None) -> int:
+    """本月「本月攻略」月任务已开放到第几周（1-based）。
+
+    Rewards 月任务按自然日窗口逐周开放：1~7 日=第 1 周，8~14 日=第 2 周，
+    15~21 日=第 3 周，22 日~月底=第 4 周（每月 4 个周任务，正好覆盖一个月）。
+    已完成的周数 >= 当前周序号，即「已按时完成 / 后续周尚未到解锁时间」，属正常，
+    不计入未完成（用户反馈：八月第一周显示 1/4 即正确，不应误报）。
+    """
+    d = now or datetime.now()
+    return (d.day - 1) // 7 + 1
 
 
 # 结构级异常（如「本月攻略定位器整月零匹配」）单独收集，发【结构异常】告警邮件，
@@ -700,8 +724,11 @@ async def _has_real_quiz_elements(np: Page) -> bool:
     except Exception:
         return False
     low = html.lower()
+    # 注意：「b_ans」是必应通用答案框（knowledge/answer box）的 class，普通搜索结果页
+    # 几乎都带它，并非问答(quiz)。把它当 quiz 信号会把搜索页误判成内嵌问答，进而被送进
+    # handle_puzzle_or_quiz 的拼图/点选流程（见 ADR-0003）。仅保留 quiz 专属 class。
     markers = ["rqansweroption", "answeroption", "officequiz", "welcomequiz",
-               "b_ans", "quizoption", "quizcontainer", "btcorpus", "fyestrivia"]
+               "quizoption", "quizcontainer", "btcorpus", "fyestrivia"]
     return any(m in low for m in markers)
 
 
@@ -716,7 +743,18 @@ async def handle_puzzle_or_quiz(np: Page) -> bool:
         return False
     low_url = np.url.lower()
     low_content = content.lower()
-    is_puzzle = ("拼图" in content) or ("imagepuzzle" in low_url) or ("puzzle" in low_url)
+    # 拼图判定：仅当 URL 明确为拼图页(imagepuzzle/puzzle)，或页面确实存在拼图专属 DOM
+    # （#skipPuzzle 或「跳过拼图」按钮）。禁止用裸「拼图」正文匹配——必应搜索结果页侧栏/
+    # 每日活动推广常含「拼图」字样(指向每日拼图活动)，会把普通搜索页误判为拼图页去点
+    # 不存在的 skipPuzzle（见 ADR-0003）。真实拼图页靠 URL 已能被稳定识别。
+    is_puzzle = ("imagepuzzle" in low_url) or ("puzzle" in low_url)
+    if not is_puzzle:
+        try:
+            if (await np.locator("#skipPuzzle").count() > 0
+                    or await np.locator("text=跳过拼图").count() > 0):
+                is_puzzle = True
+        except Exception:
+            pass
     # 注意：不能用裸「问题/question」判定——中文/必应搜索结果页到处是这些词，会被误判成 quiz 去点选答案。
     # 仅当页面含明确的测验信号：URL 含 quiz / 文案含「你是否知道」「测验」/ 或真含问答容器 class。
     is_quiz = ("quiz" in low_url) or ("你是否知道" in content) or ("测验" in content) \
@@ -967,7 +1005,7 @@ async def run_offer(target: Page, href: str, typ: str):
             if await _has_real_quiz_elements(target):
                 handled = await handle_puzzle_or_quiz(target)
                 if handled:
-                    print("    search 页识别为真实问答，已执行点选答案流程")
+                    print("    search 页检测到内嵌问答/拼图内容，已执行交互流程")
             else:
                 print("    search 页无问答容器，按搜索即计分处理（不点选）")
         except Exception as e:
@@ -1949,9 +1987,15 @@ async def _scan_unfinished(page: Page) -> list:
             if is_nav_link(o["href"]) or not o["text"]:
                 continue
             # 本月攻略的「锁定周」（左侧小锁，未到开放时间）既不是已完成也不是未完成，
-            # 不应重试、也不应写入「未完成」邮件清单（否则每月会误报未来周任务）
-            if is_monthly_strategy(o["text"], o["href"]) and is_locked_monthly(o["text"], o["href"]):
-                continue
+            # 不应重试、也不应写入「未完成」邮件清单（否则每月会误报未来周任务）。
+            # 时间判定优先：月任务共 4 周、每周一个，已完成周数 >= 当前所处周序号即属正常
+            # （如八月第一周显示 1/4）——即使文案未出现「到期日期/X周后」也不误报。
+            if is_monthly_strategy(o["text"], o["href"]):
+                done_n, _ = _parse_monthly_progress(o["text"])
+                if done_n is not None and done_n >= current_month_week_index():
+                    continue
+                if is_locked_monthly(o["text"], o["href"]):
+                    continue
             if o["done"] or _looks_done(o["text"]):
                 continue
             key = o["text"][:24]
