@@ -1,8 +1,0 @@
-[日志] 本次运行日志写入：F:\AI\tasks\auto-sign\microsoft\run_20260803_042541.log
-启动 Edge（复用登录态）...
-    复检采集 https://rewards.bing.com/dashboard 失败：Page.goto: Target page, context or browser has been closed
-Call log:
-  - navigating to "https://rewards.bing.com/dashboard", waiting until "domcontentloaded"
-
-    复检采集 https://rewards.bing.com/earn 失败：Page.goto: Target page, context or browser has been closed
-[复检] 页面上所有任务均已标记完成

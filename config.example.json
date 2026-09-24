@@ -12,8 +12,8 @@
     "enabled": false,
     "smtp_server": "smtp.qq.com",
     "smtp_port": 465,
-    "sender": "你的QQ邮箱@qq.com",
-    "auth_code": "你的QQ邮箱SMTP授权码",
-    "recipient": "接收通知的邮箱@qq.com"
+    "sender": "359083341@qq.com",
+    "auth_code": "",
+    "recipient": "359083341@qq.com"
   }
 }

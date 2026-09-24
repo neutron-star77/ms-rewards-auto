@@ -1,52 +1,52 @@
-# 隐私配置（如你在此文件填了账号密码，切勿提交）
+# ===== 敏感文件（永不入库）=====
+# 微软登录态 cookie，一旦入库即泄露，必须永久忽略
+storage_state.json
+# SSH 公钥 seed，含认证材料
+authorized_keys_seed.txt
+# 若本地生成了真实配置（示例为 config.example.json 才入库）
 config.json
 
-# 浏览器登录态 / cookie（含账号凭证，绝对不能提交）
-storage_state.json
-
-# Edge 浏览器用户配置目录（含登录凭证，体积巨大）
+# ===== 运行态 / 状态 / 调度生成物 =====
+data/
 edge_profile/
-
-# 调试输出
-dashboard_dump.txt
-*_dump.txt
-
-# 日志
+.codebuddy/
+# 遗留暂存/部署杂项（非微软积分业务）
+1/
 *.log
-nas.log
-keepalive.log
+run_*.log
+*.session
+monthly_state.json
+weekly_click_state.json
+schedule.txt
+disabled.flag
+*.lock
+.run.lock
+.schedule.lock
+manual_run.state
+auth_required.json
+verify_err.txt
+verify_out.txt
 
-# Python 缓存
+# ===== 调试 / 截图 / 页面快照 =====
+dbg_*.html
+*.png
+
+# ===== 本地备份（回滚点，不入库）=====
+*.bak
+*.bak.*
+.bak/
+
+# ===== Python =====
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
 
-# 虚拟环境 / 依赖打包
-venv/
-.venv/
-env/
-*.egg-info/
-.eggs/
-build/
-dist/
+# ===== 编辑工作副本（D1~D6 等迭代中间的 .w2/.w3）不入库 =====
+*.w2
+*.w3
+*.w[0-9]
 
-# Playwright 浏览器缓存
-ms-playwright/
-
-# 系统/编辑器
+# ===== 编辑器 / 系统 =====
+.vscode/
+.idea/
 .DS_Store
 Thumbs.db
-.idea/
-.vscode/
-
-# NAS 部署配置（含账号/路径等，绝不进公开仓库）
-config_nas.json
-
-# SSH 公钥种子（含授权信息，泄露等同于暴露 NAS 登录通道）
-authorized_keys_seed.txt
-
-# 调试快照 / 截图（含页面 DOM 与本地路径，非源码）
-dbg_*
-*.png
-_*

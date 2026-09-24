@@ -18,9 +18,7 @@ RUN pip install --no-cache-dir -r requirements_nas.txt
 RUN playwright install chromium
 
 # 只复制运行所需的脚本（登录态通过挂载的数据卷提供，勿打进镜像）
-# rewards_earn.py 为新版入口；nas_main.py 保留作兼容（旧部署 CMD 用它）
 COPY rewards_earn.py .
-COPY nas_main.py .
 
 # NAS / 无头模式开关（也可在 docker run 时通过 -e 覆盖）
 ENV REWARDS_NAS=1

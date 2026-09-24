@@ -27,6 +27,7 @@ CRONTAB="/etc/config/crontab"
 LOG="$MS_DIR/selfheal.log"
 
 log() { echo "[$(date)] selfheal: $*" | tee -a "$LOG"; }
+_is_root() { [ "$(id -u)" = "0" ]; }
 
 log "===== 开始自愈 ====="
 
@@ -71,17 +72,16 @@ IMG_CRON="*/5 * * * * /bin/sh $IMG_DIR/start_web.sh >> $IMG_DIR/web_keepalive.lo
 # 夜间扩容自检：每天 23:00 跑 sign_expand.py --check（只读），若今日未成功扩容则发告警邮件。
 # 这条与「旧 0 7 直跑扩容」条目不同：它是 --check 只读自检，必须保留（下面清理时按 --check 区分）。
 CHECK_CRON="0 23 * * * PYTHONPATH=/share/homes/Mars/.local/lib/python3.12/site-packages /share/CACHEDEV1_DATA/.qpkg/Python3/opt/python3/bin/python3 $IMG_DIR/sign_expand.py --check >> $IMG_DIR/check.log 2>&1"
-
-_is_root() { [ "$(id -u)" = "0" ]; }
+EXPAND_CRON="0 8 * * * cd $IMG_DIR && /share/CACHEDEV1_DATA/.qpkg/Python3/opt/python3/bin/python3 $IMG_DIR/sign_expand.py >> $IMG_DIR/cron.log 2>&1"
+WATCHDOG_CRON="30 23 * * * cd $IMG_DIR && /share/CACHEDEV1_DATA/.qpkg/Python3/opt/python3/bin/python3 $IMG_DIR/watchdog.py >> $IMG_DIR/watchdog.log 2>&1"
 
 # 把内容写入 /etc/config/crontab（root 直写，否则 sudo）；返回 0 表示成功
 _write_crontab() {
     _src="$1"
     if _is_root; then
         cat "$_src" > "$CRONTAB"
-    elif command -v sudo >/dev/null 2>&1; then
-        sudo sh -c "cat '$1' > '$CRONTAB'"
     else
+        log "非 root 进程不能写入 $CRONTAB；请由 autorun.sh 或 QNAP root 任务执行"
         return 1
     fi
 }
@@ -94,39 +94,49 @@ _restart_crond() {
         else
             killall -HUP crond 2>/dev/null || true
         fi
-    elif command -v sudo >/dev/null 2>&1; then
-        if [ -x /etc/init.d/crond.sh ]; then
-            sudo /etc/init.d/crond.sh restart >> "$LOG" 2>&1
-        else
-            sudo sh -c 'killall -HUP crond' 2>/dev/null || true
-        fi
+    else
+        log "非 root 进程不重启 crond；等待 root 自愈任务安装后生效"
     fi
 }
 
 # 生成干净的新 crontab：保留其它旧条目，仅去掉以下关键字行后追加新条目
-# （临时文件落在 /tmp，避免 /etc/config 不可写时失败；不再使用 mv，规避 mv -i 交互询问）
+# （临时文件落在数据卷，避免 QNAP /tmp 64MB tmpfs 满载；不使用 mv，规避 mv -i 交互询问）
 #   - nas_cron.sh  : 微软积分（重建为 */15，清掉旧 0 9,21）
 #   - start_web.sh : img.ink Web 面板保活（重建为 */5）
-#   - sign_expand.py: 旧「0 7 直跑扩容」独立条目，已冗余——扩容现由 web_app.py 内部按
-#                     config.ini 随机时段触发（web_app.py:17 SCRIPT_PATH 指向它），
-#                     旧 cron 每天 7 点直跑还会崩（缺依赖），必须清掉避免重复/报错。
-#                     注意：清的是「非 --check」的 sign_expand.py 条目；23:00 的
-#                     「sign_expand.py --check」只读自检条目要保留（下面用 grep 区分）。
-TMP_CRON="/tmp/selfheal.cron.$$"
+#   - sign_expand.py/watchdog.py: 由 cron 直接驱动；web_app.py 没有后台 scheduler，
+#     因此扩容和看门狗不能依赖 Web 面板进程。
+TMP_CRON="$MS_DIR/.selfheal.cron.$$"
 : > "$TMP_CRON"
 [ -f "$CRONTAB" ] && grep -vF "nas_cron.sh" "$CRONTAB" 2>/dev/null \
     | grep -vF "start_web.sh" \
-    | grep -vF "sign_expand.py" >> "$TMP_CRON"
+    | grep -vF "sign_expand.py" \
+    | grep -vF "watchdog.py" >> "$TMP_CRON"
 echo "$MS_CRON" >> "$TMP_CRON"
 echo "$IMG_CRON" >> "$TMP_CRON"
 echo "$CHECK_CRON" >> "$TMP_CRON"
+echo "$EXPAND_CRON" >> "$TMP_CRON"
+echo "$WATCHDOG_CRON" >> "$TMP_CRON"
 
-if _write_crontab "$TMP_CRON"; then
-    log "cron 已重建（*/15 微软 + */5 img.ink + 23:00 扩容自检）"
-    _restart_crond
-    log "crond 已重启"
+if _write_crontab "$TMP_CRON" && grep -qF "$MS_DIR/nas_cron.sh" "$CRONTAB" 2>/dev/null && grep -qF "$IMG_DIR/start_web.sh" "$CRONTAB" 2>/dev/null; then
+    spool_ok=0
+    if _is_root && command -v crontab >/dev/null 2>&1; then
+        if crontab "$CRONTAB" >> "$LOG" 2>&1 && grep -qF "$MS_DIR/nas_cron.sh" /tmp/cron/crontabs/admin 2>/dev/null; then
+            spool_ok=1
+        else
+            log "!!! crontab spool 安装失败"
+        fi
+    elif _is_root; then
+        log "!!! 找不到 crontab 安装器"
+    fi
+    if [ "$spool_ok" -ne 1 ] && _is_root; then
+        log "!!! 调度文件已写入但 spool 未验证，不能宣布自愈成功"
+    fi
+    if [ "$spool_ok" -eq 1 ] || ! _is_root; then
+        log "cron 已重建（*/15 微软 + */5 保活 + 08:00 扩容 + 23:00 自检 + 23:30 看门狗）"
+        _restart_crond
+    fi
 else
-    log "!!! 无法写入 $CRONTAB（需要 root 权限）。请二选一："
+    log "!!! cron 写入/校验失败（可能是磁盘满或需要 root），未宣布自愈成功。"
     log "    1) QNAP GUI：控制面板 → 系统 → 任务计划 → 新建用户定义脚本，命令填"
     log "       /bin/sh $MS_DIR/nas_selfheal.sh  然后点「运行」（以 root 执行）"
     log "    2) 或 sudo 运行： sudo /bin/sh $MS_DIR/nas_selfheal.sh"

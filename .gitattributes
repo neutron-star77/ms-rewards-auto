@@ -1,0 +1,10 @@
+# 统一 LF 行尾：这些文件会经 nas_push 以 LF 推到 NAS，仓库里也保持 LF，
+# 避免日常编辑在仓库引入 CRLF、进而在 NAS 上踩 line-ending 坑。
+*.sh			text eol=lf
+*.py			text eol=lf
+*.ps1			text eol=lf
+Dockerfile		text eol=lf
+*.md			text
+*.json			text
+*.yml			text eol=lf
+*.yaml			text eol=lf
